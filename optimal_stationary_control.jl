@@ -1,361 +1,167 @@
-using PyPlot
-using DataFrames
+#using PyPlot
+#addprocs(7)
 using ProgressMeter
+@everywhere using DataFrames
 
-actions = [:north, :south, :east, :west];
-
-type Maze_t
-    maze::Matrix{Char}
-    sensor_states::Vector{ASCIIString}
-    Vw::Matrix{Float64}
-    Qw::Array{Float64,3}
-    Qs::Matrix{Float64}
-    n::Matrix{Float64}
-    C::Matrix{Float64}
-    numbers::Matrix{Int64}
-    state_reward_function::Dict{Char, Float64}
-    belief::Vector{Float64}
+@everywhere type State
+    current_state::Int64
+    policy::Vector{Float64}
+    nr_world_states::Int64
+    nr_actions::Int64
+    target_sequence::Vector{Int64}
+    sum_of_rewards::Vector{Float64}
+    nr_of_evaluations::Vector{Float64}
+    value_function::Vector{Float64} # on the world state
+    state_action_value_function::Matrix{Float64} # on the world state
+    k::Int64
+    value_history::Matrix{Float64}
 end
 
-function get_action_index(symbol::Symbol)
-    r = findin(actions, [symbol])
-    if length(r) != 1
-        return -1
+@everywhere type Result
+    experiment::State
+    values::Matrix{Float64}
+end
+
+@everywhere function create_experiment(nr_world_states::Int64, nr_actions::Int64, target_actions::Int64, k::Int64)
+    policy = rand(nr_actions)
+    policy = policy / sum(policy)
+    
+    min = minimum([target_actions, nr_world_states])
+    max = maximum([0, nr_world_states - nr_actions])
+    
+    sequence = vcat([1:min], int(ceil(rand(max) * nr_actions)))
+    sequence = sequence[randperm(length(sequence))]
+    
+    return State(1, policy, nr_world_states, nr_actions, sequence, zeros(nr_world_states), zeros(nr_world_states), zeros(nr_world_states), zeros(nr_world_states, nr_actions), k, zeros(2,2))
+end
+
+@everywhere function run_episode(state::State, initial_state::Int64, T::Int64)
+    state.current_state = initial_state
+    for t = 1:T
+        p = rand()
+        s = 0
+        action = state.nr_actions
+        for i = 1:state.nr_actions
+            s = s + state.policy[i]
+            if p < s
+                action = i
+                break
+            end
         end
-    return r[1]
+        if action == state.target_sequence[state.current_state]
+            state.current_state = state.current_state + 1
+        else
+            state.current_state = 1
+        end
+        if state.current_state >= state.nr_world_states
+            return 1
+        end
+    end
+    return 0
 end
 
-function get_sensor_state(maze::Matrix{Char}, i::Int64, j::Int64)
-    foldl(string,[maze[i,j], maze[i-1,j+1], maze[i-1,j+1], maze[i, j+1], maze[i+1, j+1], maze[i+1, j], maze[i+1, j-1], maze[i,j-1], maze[i-1,j-1]])
+@everywhere function monte_carlo_estimation_of_world_state_function!(state::State, T::Int64, nr_of_episodes::Int64)
+    for e = 1:nr_of_episodes
+        initial_state                          = int64(ceil(rand()*state.nr_world_states))
+        if initial_state == 1
+          println("initial state: $(initial_state)")
+        end
+        reward                                 = run_episode(state, initial_state, T)
+        state.sum_of_rewards[initial_state]    = state.sum_of_rewards[initial_state] + reward
+        state.nr_of_evaluations[initial_state] = state.nr_of_evaluations[initial_state] + 1.0
+        state.value_function[initial_state]    = state.sum_of_rewards[initial_state] / state.nr_of_evaluations[initial_state]
+    end
 end
 
-function get_unique_sensor_states(maze::Matrix{Char})
-    sensor_states = []
-    for i=2:size(maze)[1] - 1
-        for j=2:size(maze)[2] - 1
-            if maze[i,j] != '#'
-                sensor_state = get_sensor_state(maze, i, j)
-                if sensor_state in sensor_states == false
-                    sensor_states = [sensor_states, sensor_state]
+@everywhere function calculate_world_state_action_function!(state::State)
+    for i = 1:state.nr_world_states
+        for action = 1:state.nr_actions
+            if action == state.target_sequence[i]
+                if i == state.nr_world_states
+                    state.state_action_value_function[i,action] = 1.0
+                else
+                    state.state_action_value_function[i,action] = state.value_function[i+1]
                 end
-            end
-        end
-    end
-    sensor_states
-end
-
-function get_sensor_index(maze::Matrix{Char}, i::Int64, j::Int64, sensor_states::Vector{ASCIIString})
-    sensor_state = get_sensor_state(maze, i, j)
-    lst = findin(sensor_states, [sensor_state])
-    if length(lst) >= 1 && lst[1] > 0
-        return lst[1]
-    else
-        return -1
-    end
-end
-
-function get_state_coordinate(maze::Matrix{Char}, char::Char)
-    for i=1:size(maze)[1]
-        for j = 1:size(maze)[2]
-            if maze[i,j] == char
-                return i,j
-            end
-        end
-    end
-    return -1, -1
-end
-
-function convert_string_to_string_array(s::String)
-    index = 1
-    while s[index] == ' ' || s[index] == '\n'
-        index = index + 1
-    end
-    maze = nothing
-    row = []
-    for i=index:length(s)
-        if s[i] == '\n'
-            if maze == nothing
-                maze = row
             else
-                maze = hcat(maze, row)
+                state.state_action_value_function[i,action] = state.value_function[1]
             end
-            row = []
+        end
+    end
+
+    for action = 1:state.nr_actions
+        if action == state.target_sequence[state.nr_world_states]
+            state.state_action_value_function[state.nr_world_states,action] = 1.0
         else
-            row = [row, s[i]]
+            state.state_action_value_function[state.nr_world_states,action] = state.value_function[1]
         end
     end
-    return maze'
 end
 
-function create_experiment_setup(definition::String, state_reward_function::Dict{Char,Float64})
-    maze          = convert_string_to_string_array(maze_definition)
-    sensor_states = get_unique_sensor_states(maze)
-    Vw            = zeros(size(maze))
-    Qw            = zeros(size(maze)[1], size(maze)[2], 4)
-    Qs            = zeros(length(sensor_states),4)
-    n             = zeros(size(maze))
-    C             = zeros(size(maze))
-    numbered_maze = int64(zeros(size(maze)))
-    belief        = zeros(length(sensor_states))
-    for i = 2:size(maze)[1]-1
-        for j = 2:size(maze)[2]-1
-            index = get_sensor_index(maze, i, j, sensor_states)
-            if index > 0
-                belief[index] = belief[index] + 1.0
-                numbered_maze[i,j] = index
+@everywhere function prune_world_state_action_function!(state::State)
+    nr_of_values = minimum([state.k, state.nr_actions])
+    for i = 1:state.nr_world_states
+        if sum(state.state_action_value_function[i,:]) > 0.0
+            values = DataFrame(VALUES=[v for v in state.state_action_value_function[i,:]], INDICES=[1:state.nr_actions])
+            sort!(values, cols = (:VALUES), rev=true)
+
+            values = values[1:nr_of_values,:]
+            for a = 1:state.nr_actions
+                state.state_action_value_function[i,a] = 0.0
             end
-        end
-    end
-    belief = [1.0/v for v in belief]
-    return Maze_t(maze, sensor_states, Vw, Qw, Qs, n, C, numbered_maze, state_reward_function, belief)
-end
 
-function plot_data(maze::Maze_t)
-    s = (size(maze.maze)[2], size(maze.maze)[1] .* 0.3)
-    clf()
-    figure(figsize=s)
-    subplot(121)
-    xticks([])
-    yticks([])
-    colorbar(imshow(maze.Qs, interpolation="none"))
-    title("Q(s,a)")
-    
-    subplot(122)
-    colorbar(imshow(maze.Vw, interpolation="none"))
-    xticks([])
-    yticks([])
-    clim([0,1000]) # 1000 is the maximum = V('T')
-    title("V(w)")
-end
-
-function write_plot_data(maze::Maze_t, filename::String)
-    s = (size(maze.maze)[2], size(maze.maze)[1] .* 0.3)
-    clf()
-    figure(figsize=s)
-    subplot(121)
-    xticks([])
-    yticks([])
-    colorbar(imshow(maze.Qs, interpolation="none"))
-    title("Q(s,a)")
-    
-    subplot(122)
-    colorbar(imshow(maze.Vw, interpolation="none"))
-    xticks([])
-    yticks([])
-    title("V(w)")
-    clim([0,1000]) # 1000 is the maximum = V('T')    
-    savefig(filename)
-end
-
-function policy_iteration!(maze::Maze_t, k::Int64)
-    # Q(w,a) = \sum_{w'} p(w'|a) V(w'), where p(w'|a) is a Dirac measure
-    for i = 2:size(maze.Vw)[1]-1
-        for j = 2:size(maze.Vw)[2] - 1
-            maze.Qw[i,j,1] = maze.Vw[i-1, j]
-            maze.Qw[i,j,2] = maze.Vw[i+1, j]
-            maze.Qw[i,j,3] = maze.Vw[i,   j+1]
-            maze.Qw[i,j,4] = maze.Vw[i,   j-1]
-        end
-    end
-    
-    for s = 1:length(maze.sensor_states)
-        for a = 1:4
-            maze.Qs[s,a] = 0.0
-        end
-    end
-    
-    for i = 2:size(maze.maze)[1] - 1
-        for j = 2:size(maze.maze)[2] - 1
-            index = get_sensor_index(maze.maze, i, j, maze.sensor_states)
-            if index > 0
-                for a = 1:4
-                    maze.Qs[index, a] = maze.Qs[index, a] + maze.belief[index] * maze.Qw[i,j,a]
-                end
+            for a = 1:size(values)[1]
+                state.state_action_value_function[i,values[:INDICES][a]] = values[:VALUES][a]
             end
-        end
-    end
-    
-    for s = 1:length(maze.sensor_states)
-        values = DataFrame(VALUES=[v for v in maze.Qs[s,:]], ACTION=actions[1:4], INDICES=[1:4])
-        sort!(values, cols = (:VALUES), rev=true)
-        if sum(abs(values[:,1])) < 0.001 # randomise action if no values have been aquired so far
-            r = randperm(4)
-            values[:ACTION]=actions[r]
-            values[:INDICES] = r
-        end
-        values = values[1:minimum([k, size(values)[1]]),:]
-
-        v = values[:,1]
-        if sum(v) < 0.1
-            v = [1.0/float64(length(v)) for x=1:length(v)]
         else
-            rw = sum(v)
-            v  = [w / rw for w in v]
-        end
-        values[:,1] = v
-        
-        for a = 1:4
-            maze.Qs[s,a] = 0.0
-        end
-        
-        for a = 1:size(values)[1]
-            maze.Qs[s,values[a,3]] = values[a,1]
+            indices = randperm(state.nr_actions)[1:nr_of_values]
+            for a in indices
+                state.state_action_value_function[i, a] = 0.001
+            end
         end
     end
-   # plot_data(maze, "after policy iteration")
 end
 
-function policy_evaluation!(maze::Maze_t, T::Int64, R::Int64)
-    for i = 1:R
-        # randomise start position
-        x = 1 + int64(ceil(rand() * size(maze.maze)[1])) - 1
-        y = 1 + int64(ceil(rand() * size(maze.maze)[2])) - 1
+@everywhere function update_policy_from_world_state_action_function!(state::State)
+    sum_of_values = zeros(state.nr_actions)
+    for a = 1:state.nr_actions
+        sum_of_values[a] = sum(state.state_action_value_function[:,a])
+    end
     
-        while maze.maze[x,y] == '#'
-            x = 1 + int64(ceil(rand() * size(maze.maze)[1])) - 1
-            y = 1 + int64(ceil(rand() * size(maze.maze)[2])) - 1
-        end
-    
-        init_x = x
-        init_y = y
-        
-        if maze.maze[init_x,init_y] in keys(maze.state_reward_function)
-            # we are done, if we are on a reward field
-            maze.Vw[init_x,init_y] = maze.state_reward_function[maze.maze[init_x,init_y]]
-            break
-        end
-
-        for i=1:T
-            s = get_sensor_index(maze.maze, x, y, maze.sensor_states)
-            probabilities = maze.Qs[s,:]
-            p = rand()            
-            action = actions[end]
-            for j = 1:4
-                if p < sum(probabilities[1:j])
-                    action = actions[j]
-                    break
-                end
-            end
-
-            if action == :north
-                if maze.maze[x - 1,y] == 'B'
-                    maze.C[init_x, init_y] = maze.C[init_x, init_y] - 1.0
-                    x, y = get_state_coordinate(maze.maze, 'S')
-                elseif maze.maze[x - 1,y] != '#'
-                    maze.C[init_x, init_y] = maze.C[init_x, init_y] - 1.0
-                    x = x - 1
-                end
-            elseif action == :south
-                if maze.maze[x + 1,y] == 'B'
-                    maze.C[init_x, init_y] = maze.C[init_x, init_y] - 1.0
-                    x, y = get_state_coordinate(maze.maze, 'S')
-                elseif maze.maze[x + 1,y] != '#'
-                    maze.C[init_x, init_y] = maze.C[init_x, init_y] - 1.0
-                    x = x + 1
-                end
-            elseif action == :east
-                if maze.maze[x,y + 1] == 'B'
-                    maze.C[init_x, init_y] = maze.C[init_x, init_y] - 1.0
-                    x, y = get_state_coordinate(maze.maze, 'S')
-                elseif maze.maze[x,y + 1] != '#'
-                    maze.C[init_x, init_y] = maze.C[init_x, init_y] - 1.0
-                    y = y + 1
-                end
-            elseif action == :west
-                if maze.maze[x,y - 1] == 'B'
-                    maze.C[init_x, init_y] = maze.C[init_x, init_y] - 1.0
-                    x, y = get_state_coordinate(maze.maze, 'S')
-                elseif maze.maze[x,y - 1] != '#'
-                    maze.C[init_x, init_y] = maze.C[init_x, init_y] - 1.0
-                    y = y - 1
-                end
-            end
-            if maze.maze[x,y] in keys(maze.state_reward_function)
-                maze.C[init_x, init_y] = maze.C[init_x, init_y] + maze.state_reward_function[maze.maze[x,y]]
-                break # done. we found a reward
-            end
-        end
-        maze.n[init_x, init_y]  = maze.n[init_x, init_y] + 1.0
-        maze.Vw[init_x, init_y] = maze.C[init_x, init_y] / maze.n[init_x, init_y]
+    s = sum(sum_of_values)
+    for a = 1:state.nr_actions
+        state.policy[a] = sum_of_values[a] / s
     end
-   # plot_data(maze, "after policy evaluation\n")
 end
 
-maze_definition = "
-#########
-###T   B#
-##### ###
-#B    ###
-### #####
-###S#####
-#########
-"
-
-function run_experiment(k::Int64, trials::Int64, epoch_length::Int64, T::Int64, N::Int64)
-    pm = Progress(trials * epoch_length, 1)
-    values = zeros(epoch_length)
-    mazes = []
-    for i = 1:trials
-        maze = create_experiment_setup(maze_definition, ['T' => 1000.0])
-        mazes = [mazes, maze]
-        v = zeros(epoch_length)
-        x,y = get_state_coordinate(maze.maze, 'S')
-       
-        for j = 1:epoch_length
-            policy_evaluation!(maze, N, T)
-            policy_iteration!(maze, k)
-            v[j] = maze.Vw[x,y]
-            next!(pm)
-        end
-        values = values .+ v
-    end
-    return mazes, (values ./ float64(trials))
+@everywhere function update_policy!(state::State)
+    calculate_world_state_action_function!(state)
+    prune_world_state_action_function!(state) 
+    update_policy_from_world_state_action_function!(state)
 end
 
-m4, v4 = run_experiment(4, 100, 5000, 100, 10)
-plot(v4)
-plot_data(m4[1])
-writecsv("4.csv", v4)
-f = open("4.dat", "w")
-serialize(f, m4)
-close(f)
+@everywhere function scan_over_k(k::Int64, N::Int64, episode_length::Int64, nr_of_episodes::Int64)
+    nr_world_states   = k + 1
+    nr_of_actions     = k
+    exp               = create_experiment(nr_world_states, nr_of_actions, nr_of_actions, k)
+    exp.value_history = zeros(N, nr_world_states)
+    pm = Progress(N, 1)
+    for i = 1:N
+        monte_carlo_estimation_of_world_state_function!(exp, (episode_length+1) * k, nr_of_episodes)
+        update_policy!(exp)
+        exp.value_history[i,:] = exp.value_function
+        next!(pm)
+    end
+    return exp
+end
 
-m3, v3 = run_experiment(3, 100, 5000, 100, 10)
-plot(v3)
-plot_data(m3[1])
-writecsv("3.csv", v3)
-f = open("3.dat", "w")
-serialize(f, m3)
-close(f)
+#= N               = 1000000 =#
+#= nr_world_states = 5 =#
+#= nr_of_actions   = 5 =#
+#= k               = 5 =#
+#= v,r = scan_over_k(k, N, nr_world_states, nr_of_actions) =#
 
-m2, v2 = run_experiment(2, 100, 5000, 100, 10)
-plot(v2)
-plot_data(m2[1])
-writecsv("2.csv", v2)
-f = open("2.dat", "w")
-serialize(f, m2)
-close(f)
+#= println("policy") =#
+#= println(r.policy) =#
 
-m1, v1 = run_experiment(1, 100, 5000, 100, 10)
-plot(v1)
-plot_data(m1[1])
-writecsv("1.csv", v1)
-f = open("1.dat", "w")
-serialize(f, m1)
-close(f)
-
-p4=plot(v4)
-p3=plot(v3)
-p2=plot(v2)
-p1=plot(v1)
-legend( [p4,p3,p2,p1], ["k=4","k=3","k=2","k=1"], loc=4)
-
-savefig("plot.png")
-
-plot_data(m2[25])
-
-m2[25].Vw
-
-plot_data(m2[25])
-
-m3[5].Vw
+#= println("state action value function") =#
+#= println(r.state_action_value_function) =#
